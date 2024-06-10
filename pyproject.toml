@@ -1,0 +1,81 @@
+[tool.poetry]
+name = "accel-snn"
+version = "0.1.0"
+description = ""
+authors = ["Mike Lasby"]
+homepage = "https://github.com/mklasby/accel-snn"
+readme = "README.md"
+license = "MIT"
+keywords = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+packages= [
+    {include = "accelsnn", from = "src"},
+]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.11"
+torch= [
+    {version="2.3.1+cu121", source="torch_repo", markers="sys_platform == 'linux'"},
+]
+torchvision=[
+    {version="^0.18.1+cu121", source="torch_repo", markers="sys_platform == 'linux'"},
+]
+python-dotenv="^1"
+
+[[tool.poetry.source]]
+name = "torch_repo"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "supplemental"
+
+[tool.poetry.group.dev.dependencies]
+flake8 = "^7.0.0"
+black = "^24.2.0"
+jupyter = "^1.0.0"
+jupytext = "^1.16.1"
+pre-commit = "^3.6.2"
+matplotlib = "^3.8.3"
+pytest = "^8.1.1"
+pytest-cov = "^5.0.0"
+
+[tool.poetry.scripts]
+main = "main:main"
+
+[tool.poetry.urls]
+"Issues" = "https://github.com/mklasby/accel-snn/issues"
+"Repo" = "https://github.com/mklasby/accel-snn"
+
+
+[build-system]
+requires = ["poetry-core>=1.8.1"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 80
+exclude ='''
+/(
+    artifacts/*
+    | .venv/*
+)
+'''
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".", "./src", "./tests"
+]
+# addopts = "--cov src --cov-report html --cov-branch --import-mode importlib"
+addopts = "--import-mode importlib"
+markers = [
+    "integration",
+    "slow",
+    "dist",
+]
+norecursedirs = "tests/utils"
+testpaths = "tests"
