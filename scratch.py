@@ -21,7 +21,7 @@ __DEVICE = torch.device("cuda")
 __INPUT_DIM = 762
 __OUTPUT_DIM = 4096
 __BATCH_SIZE = 128
-__SPARSITY = 0.95
+__SPARSITY = 0.96
 
 
 # +
@@ -53,10 +53,13 @@ def print_sparsity(mod: nn.Linear):
 
 # -
 
+
 linear = nn.Linear(
     in_features=__INPUT_DIM, out_features=__OUTPUT_DIM, device=__DEVICE
 )
 sparse_linear = get_ffi_structure(linear, __SPARSITY)
+
+(sparse_linear.weight[0] != 0).sum()
 
 x = torch.rand(size=(__BATCH_SIZE, __INPUT_DIM), device=__DEVICE)
 x.shape
@@ -133,7 +136,6 @@ ffi_naive = FFILinearNaive(sparse_linear)
 # sparse_linear(x).allclose(ffi_naive(x), atol=1e-07)
 
 
-# +
 class FFILinearVmap(FFILinearNaive):
     def __init__(
         self,
@@ -157,7 +159,7 @@ class FFILinearVmap(FFILinearNaive):
     def forward(self, input: torch.Tensor):
         return torch.vmap(
             self.batch_kernel, in_dims=(0, None, None, None), out_dims=0
-        )(x, self.input_mask, self.condensed_weight, self.bias)
+        )(input, self.input_mask, self.condensed_weight, self.bias)
 
 
 ffi_vmap = FFILinearVmap(sparse_linear, vectorize=True)
@@ -261,15 +263,16 @@ def ffi_triton(
     input_offset = tl.expand_dims(batch_offsets, 1) * n_in + mask
     input_mask = input_offset < n_in * n_batch
     inputs = tl.load(input_p + input_offset, input_mask)
-    tl.dot(inputs, weights, acc=output, allow_tf32=False)
+    output += tl.dot(inputs, weights, allow_tf32=False)
     tl.store(output_p + output_offsets, output, output_mask)
 
 
-output = torch.zeros(size=(__BATCH_SIZE, __OUTPUT_DIM), device=__DEVICE)
-input = x
-weight = ffi_vmap.condensed_weight.T  # shape is ffi, output
-bias = ffi_vmap.bias
-mask = ffi_vmap.input_mask
+# output = torch.zeros(size=(__BATCH_SIZE, __OUTPUT_DIM), device=__DEVICE)
+output = torch.zeros(size=(32, 32), device=__DEVICE)
+input = x[:32]
+weight = ffi_vmap.condensed_weight.T[:, :32]  # shape is now ffi, output
+bias = ffi_vmap.bias[:32]
+mask = ffi_vmap.input_mask[:, :32]
 n_elements = input.numel()
 n_weights = weight.numel()
 FFI_PER_NEURON = weight.shape[0]  # first dim is now ffi
@@ -296,4 +299,125 @@ ffi_triton[grid](
     BLOCK_SIZE_X,
     BLOCK_SIZE_Y,
 )
-print(output)
+# -
+
+output
+
+ffi_compiled(x)
+
+
+output.shape
+
+8160 / 4
+
+(output != 0).sum()
+
+
+class FixedFanInCuda(nn.Module):
+    def __init__(
+        self,
+        module: nn.Module,
+        dtype: torch.typename = torch.float32,
+        transpose: bool = True,
+        vectorize: bool = False,
+        index_dtype: torch.typename = torch.int32,
+    ):
+        super().__init__()
+        if dtype is None:
+            dtype = module.weight.dtype
+
+        self.transpose = transpose
+        with torch.no_grad():
+            active_neuron_idx = module.weight.sum(dim=1) != 0
+            fine_grained_idx = (module.weight[active_neuron_idx] != 0).to(
+                torch.bool
+            )
+            _, self.input_mask = fine_grained_idx.nonzero(as_tuple=True)
+            self.input_mask = self.input_mask.reshape(
+                shape=(module.weight[active_neuron_idx].shape[0], -1)
+            ).to(index_dtype)
+            weight = module.weight[active_neuron_idx].detach().type(dtype)
+            weight = torch.clone(
+                weight[fine_grained_idx]
+                .reshape(shape=(weight.shape[0], -1))
+                .detach()
+                .type(dtype)
+            )
+            # padding to multiple of 4
+            if vectorize:
+                pad = (
+                    self.input_mask.shape[1] + 3
+                ) // 4 * 4 - self.input_mask.shape[1]
+                self.input_mask = F.pad(self.input_mask, [0, pad])
+                weight = F.pad(weight, [0, pad])
+
+            self.condensed_weight = nn.Parameter(
+                weight,
+                requires_grad=False,
+            )
+
+            if hasattr(module, "bias"):
+                self.bias = nn.Parameter(
+                    torch.clone(
+                        module.bias[active_neuron_idx].detach().type(dtype)
+                    ),
+                    requires_grad=False,
+                )
+            else:
+                self.register_parameter("bias", None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return ffi_mul(
+            input,
+            self.condensed_weight,
+            self.input_mask,
+            self.bias,
+            transpose=self.transpose,
+        )
+
+
+class CondensedLinearFineGrained(nn.Module):
+    def __init__(
+        self, module: nn.Module, dtype: torch.typename = torch.float32
+    ):
+        super().__init__()
+        if dtype is None:
+            dtype = module.weight.dtype
+        with torch.no_grad():
+            active_neuron_idx = module.weight.sum(dim=1) != 0
+            fine_grained_idx = (module.weight[active_neuron_idx] != 0).to(
+                torch.bool
+            )
+            _, self.input_mask = fine_grained_idx.nonzero(as_tuple=True)
+            self.input_mask = self.input_mask.reshape(
+                shape=(module.weight[active_neuron_idx].shape[0], -1)
+            )
+            self.input_mask = self.input_mask.to(torch.int32)
+            weight = module.weight[active_neuron_idx].detach().type(dtype)
+            self.condensed_weight = nn.Parameter(
+                torch.clone(
+                    weight[fine_grained_idx]
+                    .reshape(shape=(weight.shape[0], -1))
+                    .detach()
+                    .type(dtype)
+                ),
+                requires_grad=False,
+            )
+            if hasattr(module, "bias"):
+                self.bias = nn.Parameter(
+                    torch.clone(
+                        module.bias[active_neuron_idx].detach().type(dtype)
+                    ),
+                    requires_grad=False,
+                )
+            else:
+                self.register_parameter("bias", None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.sum(
+                self.condensed_weight * input[..., self.input_mask],
+                dim=input.dim(),
+            )
+            + self.bias
+        )
